@@ -3,6 +3,7 @@
 #include <mc/world/actor/state/PropertySyncData.h>
 
 
+#include "ll/api/base/StdInt.h"
 #include "ll/api/event/player/PlayerDisconnectEvent.h"
 #include "ll/api/io/LoggerRegistry.h"
 #include "ll/api/mod/RegisterHelper.h"
@@ -29,13 +30,13 @@
 #include <ll/api/mod/NativeMod.h>
 #include <ll/api/service/Bedrock.h>
 #include <mc/entity/components/SynchedActorDataComponent.h>
+#include <mc/network/LoopbackPacketSender.h>
 #include <mc/network/MinecraftPackets.h>
+#include <mc/network/NetworkIdentifierWithSubId.h>
 #include <mc/network/PacketSender.h>
 #include <mc/network/packet/AddActorPacket.h>
-#include <mc/network/packet/BookEditPacket.h>
 #include <mc/network/packet/InventoryContentPacket.h>
-#include <mc/network/packet/LegacyTelemetryEventPacket.h>
-#include <mc/network/packet/LoginPacket.h>
+#include <mc/network/packet/PlayerListPacket.h>
 #include <mc/network/packet/SetActorDataPacket.h>
 #include <mc/network/packet/SyncedAttribute.h>
 #include <mc/scripting/ServerScriptManager.h>
@@ -49,11 +50,13 @@
 #include <mc/world/actor/DataItemType.h>
 #include <mc/world/actor/SynchedActorData.h>
 #include <mc/world/actor/player/Player.h>
+#include <mc/world/actor/player/PlayerListEntry.h>
 #include <mc/world/actor/state/PropertySyncData.h>
 #include <mc/world/attribute/AttributeInstanceHandle.h>
 #include <mc/world/item/NetworkItemStackDescriptor.h>
 #include <memory>
 #include <stdexcept>
+
 
 
 #include <string>
@@ -63,20 +66,95 @@
 
 auto dedicatedServerLogger = ll::io::LoggerRegistry::getInstance().getOrCreate("DedicatedServer");
 
-void translateEntityNameTag(std::vector<std::unique_ptr<DataItem>>& mData, Player* player) {
+using MData = std::vector<std::unique_ptr<DataItem>>&;
+
+int64 findNameTagDataItem(MData mData) {
     auto it = std::find_if(mData.begin(), mData.end(), [&](const std::unique_ptr<DataItem>& item) {
         return item && item->getId() == (ushort)ActorDataIDs::Name;
     });
 
     if (it != mData.end()) {
-        size_t index   = std::distance(mData.begin(), it);
+        return std::distance(mData.begin(), it);
+    } else {
+        return -1;
+    }
+}
+
+bool isNameTagTranslatable(MData mData, int64 index) {
+    if (index == (-1)) return false;
+
+    auto& item    = *mData[index];
+    auto  nameTag = *item.getData<std::string>();
+    if (nameTag == "notrans") return false;
+    return true;
+}
+
+void translateEntityNameTag(MData mData, int64 index, Player* player) {
+    if (isNameTagTranslatable(mData, index)) {
+        auto nameTag = mData[index]->getData<std::string>();
+        dedicatedServerLogger->info("Translating name tag from {} for {}", nameTag->data(), player->getRealName());
+
         (mData)[index] = DataItem::create(
             ActorDataIDs::Name,
-            std::string("Custom entity name for " + player->getRealName() + " " + player->getLocaleCode())
+            std::string("For " + player->getRealName() + " " + player->getLocaleCode())
         );
     } else {
         dedicatedServerLogger->info("Not found name tag for data with size {}", mData.size());
     }
+}
+
+std::string translatePlayerNameTag(const std::string& nameTag, Player* forPlayer) {
+    return nameTag + " For " + forPlayer->getRealName();
+}
+
+
+ServerPlayer* getPlayerFromNetworkId(::NetworkIdentifier const& id, ::SubClientId recipientSubId) {
+    auto serverNetworkHandler = ll::service::getServerNetworkHandler();
+    if (!serverNetworkHandler) {
+        return nullptr;
+    }
+
+    ServerPlayer* player = serverNetworkHandler->_getServerPlayer(id, recipientSubId);
+    if (!player) {
+        return nullptr;
+    }
+
+    return player;
+}
+
+LL_AUTO_TYPE_INSTANCE_HOOK(
+    SetActorDataPacketSendHook,
+    ll::memory::HookPriority::High,
+    LoopbackPacketSender,
+    &LoopbackPacketSender::$sendToClients,
+    void,
+    ::std::vector<::NetworkIdentifierWithSubId> const& ids,
+    ::Packet const&                                    packet
+) {
+    auto packetId = packet.getId();
+
+    if (packetId == MinecraftPacketIds::SetActorData) {
+
+        auto& casted = static_cast<const SetActorDataPacket&>(packet);
+        auto& mData  = const_cast<MData>(casted.mPackedItems);
+        auto  index  = findNameTagDataItem(mData);
+
+        if (isNameTagTranslatable(mData, index)) {
+            dedicatedServerLogger->info("SetActorDataHook: Sending {} ", packet.getName());
+
+            for (auto& id : ids) {
+                auto player = getPlayerFromNetworkId(id.id, id.subClientId);
+                if (player) {
+                    translateEntityNameTag(mData, index, player);
+                    this->sendTo(id.id, id.subClientId, const_cast<Packet&>(packet));
+                } else {
+                    dedicatedServerLogger->info("SetActorDataHook: Unable to find player, skipping");
+                }
+            }
+            return;
+        }
+    }
+    return origin(ids, packet);
 }
 
 
@@ -88,121 +166,46 @@ LL_AUTO_TYPE_INSTANCE_HOOK(
     void,
     const ::NetworkIdentifier& id,
     const Packet&              packet,
-    ::SubClientId              subClientId
+    ::SubClientId              subId
 ) {
-    auto serverNetworkHandler = ll::service::getServerNetworkHandler();
-    if (!serverNetworkHandler) {
-        return origin(id, packet, subClientId);
-    }
-
-    ServerPlayer* player = serverNetworkHandler->_getServerPlayer(id, subClientId);
-    if (!player) {
-        return origin(id, packet, subClientId);
-    }
-
     auto packetId = packet.getId();
-    dedicatedServerLogger->info("Sending {} to {}", packet.getName(), player->getRealName());
 
-    if (packetId == MinecraftPacketIds::AddActor || packetId == MinecraftPacketIds::LegacyTelemetryEvent
-        || packetId == MinecraftPacketIds::CommandOutput) {
-        BinaryStream bs;
-        packet.write(bs);
-        dedicatedServerLogger->info("Text data {}", bs.mBuffer.data());
-    }
+    if (packetId == MinecraftPacketIds::AddActor || packetId == MinecraftPacketIds::InventoryContent
+        || packetId == MinecraftPacketIds::PlayerList) {
+        auto player = getPlayerFromNetworkId(id, subId);
+        if (!player) return origin(id, packet, subId);
 
-    if (packetId == MinecraftPacketIds::SetActorData || packetId == MinecraftPacketIds::AddActor
-        || packetId == MinecraftPacketIds::InventoryContent || packetId == MinecraftPacketIds::ActorEvent
-        || packetId == MinecraftPacketIds::SyncActorProperty) {
+        dedicatedServerLogger->info("Sending {} to {}", packet.getName(), player->getRealName());
 
+        // if (packetId == MinecraftPacketIds::PlayerList) {
+        //     auto& casted = static_cast<const PlayerListPacket&>(packet);
 
-        if (packetId == MinecraftPacketIds::SetActorData) {
-            auto& casted = static_cast<const SetActorDataPacket&>(packet);
-
-            // BinaryStream bs;
-            // packet.write(bs);
-            // SetActorDataPacket newPacket{casted.mId, casted.mPackedItems, casted.mSynchedProperties, casted.mTick,
-            // false};
-
-            // BinaryStream bs2;
-            // newPacket.write(bs2);
-            // dedicatedServerLogger->info("Text data {}", bs2.mBuffer.data());
-
-            // newPacket._read(bs);
-
-            for (auto& item : casted.mPackedItems) {
-                if (item) {
-                    auto itemDataId = item->getId();
-                    if (itemDataId == (ushort)ActorDataIDs::Name) {
-                        item->setData<std::string>("Translate and set name here");
-                        dedicatedServerLogger->info(
-                            "Text nameTag data with content {}",
-                            item->getData<std::string>()->data()
-                        );
-                    }
-                }
-            }
-
-            dedicatedServerLogger->info("Data size {}", casted.mPackedItems.size());
-
-            return origin(id, casted, subClientId);
-        }
-
-        // if (packetId == MinecraftPacketIds::AddActor) {
-        // BinaryStream bs;
-        // packet.write(bs);
-        // AddActorPacket newPacket{};
-        // newPacket.read(bs);
-
-        //     for (auto& item : *newPacket.mData) {
-        //         if (item) {
-        //             auto itemDataId = item->getId();
-        //             if (itemDataId == (ushort)ActorDataIDs::Name) {
-        //                 // item->setData<std::string>("Custom name HAAH LL");
-        //                 dedicatedServerLogger->info(
-        //                     "Text nameTag data with id {} and content {}",
-        //                     itemDataId,
-        //                     item->getData<std::string>()->data()
-        //                 );
-        //             }
-        //         }
+        //     for (auto& entry : *casted.mEntries) {
+        //         (*entry.mName) = translatePlayerNameTag(*entry.mName, player);
         //     }
-
-        //     BinaryStream bs2;
-        //     newPacket.write(bs2);
-
-        //     dedicatedServerLogger->info("Buffer1 '{}' '{}' ", bs.mBuffer.data(), bs2.mBuffer.data());
-
-        //     return origin(id, packet, subClientId);
         // }
 
         if (packetId == MinecraftPacketIds::AddActor) {
             auto& casted = static_cast<const AddActorPacket&>(packet);
             auto& mData  = casted.mEntityData->mData.get()->mData->mItemsArray;
+            auto  index  = findNameTagDataItem(mData);
 
-            translateEntityNameTag(mData, player);
+            translateEntityNameTag(mData, index, player);
 
-            return origin(id, casted, subClientId);
+            return origin(id, casted, subId);
         }
 
-        // if (packetId == MinecraftPacketIds::BookEdit) {
-        //     BookEditPacket actorData(static_cast<const BookEditPacket&>(packet));
-        //     dedicatedServerLogger->info("Got properties");
-        // }
+        if (packetId == MinecraftPacketIds::InventoryContent) {
+            auto& casted = (static_cast<const InventoryContentPacket&>(packet));
 
+            for (auto& slot : *casted.mSlots) {
+                slot.mImpl;
+            }
 
-        // if (packetId == MinecraftPacketIds::Login) {
-        //     LoginPacket actorData(static_cast<const LoginPacket&>(packet));
-        //     dedicatedServerLogger->info("Got properties");
-        // }
-
-        // if (packetId == MinecraftPacketIds::InventoryContent) {
-        //     InventoryContentPacket casted = (static_cast<const InventoryContentPacket&>(packet));
-        //     InventoryContentPacket copiedAndCasted(casted);
-        //     // Modify inventory content
-        //     return origin(id, copiedAndCasted, subClientId);
-        // }
+            return origin(id, casted, subId);
+        }
     }
-    return origin(id, packet, subClientId);
+    return origin(id, packet, subId);
 }
 
 
